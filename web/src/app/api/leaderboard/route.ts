@@ -2,7 +2,7 @@ import { withRequestId } from "@/lib/with-request-id";
 import { NextRequest } from "next/server";
 import { db } from "@/db";
 import { tlsTalos, tlsPatrons, tlsActivities, tlsRevenues } from "@/db/schema";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, sql, type SQL } from "drizzle-orm";
 import { badRequest, internalError } from "@/lib/api-response";
 import { parseLimit, LEADERBOARD_DEFAULT_LIMIT, LEADERBOARD_MAX_LIMIT, MAX_CURSOR_LENGTH } from "@/lib/limits";
 
@@ -42,7 +42,7 @@ async function _GET(request: NextRequest) {
       .groupBy(tlsRevenues.talosId)
       .as("revenueSum");
 
-    const conditions: ReturnType<typeof sql>[] = [];
+    const conditions: (SQL | ReturnType<typeof sql>)[] = [isNull(tlsTalos.deletedAt)];
 
     let parsedCursor: [number, string] | null = null;
     if (cursor) {
