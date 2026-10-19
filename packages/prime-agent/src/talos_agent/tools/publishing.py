@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from rich.console import Console
 
+from talos_agent.redact import LOG_TEXT_MAX_CHARS, redact_text
 from talos_agent.tools.registry import tool
 
 if TYPE_CHECKING:
@@ -19,6 +20,7 @@ console = Console()
 _adapter_registry: AdapterRegistry = None  # type: ignore[assignment]
 
 _TIMEOUT = 90  # seconds
+_MAX_ERROR_CHARS = LOG_TEXT_MAX_CHARS
 
 
 def _publish_safe(fn: Callable) -> Callable:
@@ -33,7 +35,10 @@ def _publish_safe(fn: Callable) -> Callable:
         except asyncio.TimeoutError:
             return {"error": f"Publishing action timed out after {_TIMEOUT}s"}
         except Exception as e:
-            return {"error": f"{type(e).__name__}: {e}"}
+            redacted_msg = redact_text(str(e))
+            if len(redacted_msg) > _MAX_ERROR_CHARS:
+                redacted_msg = redacted_msg[: _MAX_ERROR_CHARS - 1] + "…"
+            return {"error": f"{type(e).__name__}: {redacted_msg}"}
 
     return wrapper
 

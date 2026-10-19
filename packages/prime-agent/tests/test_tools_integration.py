@@ -536,3 +536,56 @@ class TestWebAPIRevenueReporting:
 
             assert result["id"] == "revenue-record"
             mock_api.report_revenue.assert_called_once()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Publishing Tool Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestPublishingToolRedaction:
+    """Test exception redaction and bounding in publishing tools."""
+
+    @pytest.mark.asyncio
+    async def test_publish_safe_redacts_tokens_and_preserves_error_type(self):
+        """A raised exception containing a fake token returns a redacted message."""
+        from talos_agent.tools import publishing
+
+        mock_registry = MagicMock()
+        mock_adapter = AsyncMock()
+        mock_adapter.validate_content.return_value = (True, None)
+        fake_token = "sk-live-4f9c2a7e1b8d3c6e"
+        mock_adapter.post.side_effect = RuntimeError(
+            f"Telegram request failed with token={fake_token}"
+        )
+        mock_registry.get.return_value = mock_adapter
+
+        with patch.object(publishing, "_adapter_registry", mock_registry):
+            result = await publishing.publish_content("test post", channel="telegram")
+
+            assert "error" in result
+            assert result["error"].startswith("RuntimeError: ")
+            assert fake_token not in result["error"]
+            assert "[REDACTED]" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_publish_safe_bounds_length(self):
+        """Error messages are truncated to a bounded length."""
+        from talos_agent.tools import publishing
+        from talos_agent.redact import LOG_TEXT_MAX_CHARS
+
+        mock_registry = MagicMock()
+        mock_adapter = AsyncMock()
+        mock_adapter.validate_content.return_value = (True, None)
+        long_detail = "x" * (LOG_TEXT_MAX_CHARS + 500)
+        mock_adapter.post.side_effect = ValueError(long_detail)
+        mock_registry.get.return_value = mock_adapter
+
+        with patch.object(publishing, "_adapter_registry", mock_registry):
+            result = await publishing.publish_content("test post", channel="telegram")
+
+            assert "error" in result
+            assert result["error"].startswith("ValueError: ")
+            msg_body = result["error"][len("ValueError: "):]
+            assert len(msg_body) <= LOG_TEXT_MAX_CHARS
+
