@@ -48,6 +48,7 @@
 //! | `adm_prp`  | `(symbol,)`                               | `(current: Address, proposed: Address)`            |
 //! | `adm_acc`  | `(symbol,)`                               | `(new_admin: Address,)`                            |
 //! | `adm_cnl`  | `(symbol,)`                               | `(cancelled: Address,)`                            |
+//! | `reg_upd`  | `(symbol,)`                               | `(old_registry: Address, new_registry: Address)`   |
 //!
 //! ## Compatibility / rollout notes
 //!
@@ -61,7 +62,7 @@
 //!
 //! ## Version
 //!
-//! `CONTRACT_VERSION = (1, 1, 0)`
+//! `CONTRACT_VERSION = (1, 2, 0)`
 
 #![no_std]
 
@@ -69,7 +70,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    Symbol, Vec,
 };
 
 // ── Error types ─────────────────────────────────────────────────────────────
@@ -117,6 +119,8 @@ pub enum ContractError {
     InconsistentShareData = 17,
     /// No pending admin transfer exists to accept or cancel.
     NoPendingAdmin = 18,
+    /// The new registry contract does not expose the expected TalosRegistry interface.
+    IncompatibleRegistry = 19,
 }
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -213,6 +217,56 @@ const MIN_EPOCH_AMOUNT: i128 = 1;
 /// - **patch** — bug-fix with no observable ABI change
 pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 2, 0);
 
+/// Expected `INTERFACE_ID` of the configured `RegistryContract`, mirroring
+/// the bytes published by `talos_registry::INTERFACE_ID` (namespace
+/// `"TalosRegistry"`, version `(1, 4, 0)`). Kept as an inline copy rather
+/// than a crate dependency so this contract's ABI check has no build-time
+/// coupling to the Registry crate.
+pub const EXPECTED_REGISTRY_INTERFACE_ID: [u8; 32] = [
+    0x54, 0x61, 0x6C, 0x6F, 0x73, 0x52, 0x65, 0x67, // "TalosReg"
+    0x69, 0x73, 0x74, 0x72, 0x79, 0x00, 0x00, 0x00, // "istry" + zero pads
+    // (major, minor, patch) big-endian u32s
+    0x00, 0x00, 0x00, 0x01, // major = 1
+    0x00, 0x00, 0x00, 0x04, // minor = 4
+    0x00, 0x00, 0x00, 0x00, // patch = 0
+    // reserved
+    0x00, 0x00, 0x00, 0x00,
+];
+
+pub const INTERFACE_NAMESPACE: &str = "TalosDividends";
+
+pub const INTERFACE_ID: [u8; 32] = [
+    0x54, 0x61, 0x6C, 0x6F, 0x73, 0x44, 0x69, 0x76, // "TalosDiv"
+    0x69, 0x64, 0x65, 0x6E, 0x64, 0x73, 0x00, 0x00, // "idends" + zero pad
+    0x00, 0x00, 0x00, 0x01, // major = 1
+    0x00, 0x00, 0x00, 0x02, // minor = 2
+    0x00, 0x00, 0x00, 0x00, // patch = 0
+    0x00, 0x00, 0x00, 0x00, // reserved
+];
+
+pub fn features_list() -> &'static [&'static str] {
+    &[
+        "epoch_commitment",
+        "pull_claims",
+        "expiry_recovery",
+        "rounding_dust",
+        "interface_query",
+    ]
+}
+
+pub fn version_supports(actual: (u32, u32, u32), required: (u32, u32, u32)) -> bool {
+    if actual.0 != required.0 {
+        return false;
+    }
+    if actual.1 > required.1 {
+        return true;
+    }
+    if actual.1 < required.1 {
+        return false;
+    }
+    actual.2 >= required.2
+}
+
 // ── Events ───────────────────────────────────────────────────────────────────
 //
 // All events follow the schema documented in the module-level doc comment.
@@ -263,6 +317,11 @@ fn emit_admin_accepted(env: &Env, new_admin: Address) {
 fn emit_admin_cancelled(env: &Env, cancelled: Address) {
     let topics = (symbol_short!("adm_cnl"),);
     env.events().publish(topics, (cancelled,));
+}
+
+fn emit_registry_updated(env: &Env, old_registry: Address, new_registry: Address) {
+    let topics = (symbol_short!("reg_upd"),);
+    env.events().publish(topics, (old_registry, new_registry));
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -327,6 +386,63 @@ fn compute_rounding_dust(
     total_amount
         .checked_sub(distributed)
         .ok_or(ContractError::Overflow)
+}
+
+/// Compatibility helper: returns true if `actual` semver satisfies `required`.
+///
+/// Mirrors `TalosRegistry::version_supports` so callers in both modules
+/// get identical answers even though no shared crate is imported:
+///
+/// - `major` must match exactly.
+/// - `actual.minor > required.minor`        → supported.
+/// - `actual.minor == required.minor` and `actual.patch >= required.patch`
+///                                          → supported.
+/// - `actual.minor < required.minor`        → not supported.
+fn version_supports(actual: (u32, u32, u32), required: (u32, u32, u32)) -> bool {
+    if actual.0 != required.0 {
+        return false;
+    }
+    if actual.1 > required.1 {
+        return true;
+    }
+    if actual.1 < required.1 {
+        return false;
+    }
+    actual.2 >= required.2
+}
+
+/// Cross-contract compatibility helper.
+///
+/// Verifies that a contract registered as a `TalosRegistry` actually
+/// publishes the expected `INTERFACE_ID`. Returns `true` on success,
+/// `Err(IncompatibleRegistry)` on failure.
+fn check_registry_compatible(
+    env: &Env,
+    registry: &Address,
+) -> Result<(), ContractError> {
+    // Single atomic cross-contract read: interface ID + version tuple.
+    let registry_id: BytesN<32> = env.invoke_contract(
+        registry,
+        &Symbol::new(env, "interface_id"),
+        soroban_sdk::vec![env],
+    );
+
+    if registry_id != BytesN::from_array(env, &EXPECTED_REGISTRY_INTERFACE_ID) {
+        return Err(ContractError::IncompatibleRegistry);
+    }
+
+    let version: (u32, u32, u32) = env.invoke_contract(
+        registry,
+        &Symbol::new(env, "version"),
+        soroban_sdk::vec![env],
+    );
+
+    // Require the registry at major=1, minor >= 1.
+    if !version_supports(version, (1, 1, 0)) {
+        return Err(ContractError::IncompatibleRegistry);
+    }
+
+    Ok(())
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -650,6 +766,45 @@ impl TalosDividends {
         Ok(unclaimed)
     }
 
+    // ── Registry management ───────────────────────────────────────────────────
+
+    /// Update the registered TalosRegistry contract address.
+    ///
+    /// Requires admin authorization and verifies that the new registry
+    /// exposes the expected TalosRegistry interface (v1.1.0 or higher).
+    ///
+    /// # Authorization
+    /// Requires the configured admin to sign the transaction.
+    ///
+    /// # Panics / Errors
+    /// - [`ContractError::Unauthorized`]        — caller is not admin.
+    /// - [`ContractError::IncompatibleRegistry`] — new registry does not expose
+    ///                                            the expected interface.
+    pub fn set_registry_contract(
+        env: Env,
+        admin: Address,
+        new_registry: Address,
+    ) -> Result<(), ContractError> {
+        require_admin(&env, &admin)?;
+
+        // Verify the new registry is compatible before updating.
+        check_registry_compatible(&env, &new_registry)?;
+
+        let old: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RegistryContract)
+            .ok_or(ContractError::NotInitialized)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RegistryContract, &new_registry);
+
+        emit_registry_updated(&env, old, new_registry);
+
+        Ok(())
+    }
+
     // ── Read-only queries ────────────────────────────────────────────────────
 
     /// Return the epoch record for `(talos_id, epoch_id)`, or `None` if absent.
@@ -698,6 +853,23 @@ impl TalosDividends {
     /// cannot be altered by any post-deployment state write.
     pub fn version(_env: Env) -> (u32, u32, u32) {
         CONTRACT_VERSION
+    }
+
+    pub fn interface_id(env: Env) -> BytesN<32> {
+        BytesN::from_array(&env, &INTERFACE_ID)
+    }
+
+    pub fn supports_version(env: Env, major: u32, minor: u32, patch: u32) -> bool {
+        let _ = env;
+        version_supports(CONTRACT_VERSION, (major, minor, patch))
+    }
+
+    pub fn interface_features(env: Env) -> Vec<Symbol> {
+        let mut features = Vec::new(&env);
+        for feature in features_list() {
+            features.push_back(Symbol::new(&env, feature));
+        }
+        features
     }
 
     // ── Two-step admin transfer ──────────────────────────────────────
@@ -1248,7 +1420,7 @@ mod tests {
     #[test]
     fn version_returns_compile_time_constant() {
         let (env, contract_id, _, _, client) = setup();
-        assert_eq!(client.version(), (1u32, 1u32, 0u32));
+        assert_eq!(client.version(), (1u32, 2u32, 0u32));
         let _ = (env, contract_id);
     }
 
@@ -1257,6 +1429,40 @@ mod tests {
         let (env, contract_id, _, _, client) = setup();
         assert_eq!(client.version(), CONTRACT_VERSION);
         let _ = (env, contract_id);
+    }
+
+    #[test]
+    fn interface_id_matches_pinned_golden_vector() {
+        let (_, _, _, _, client) = setup();
+        let expected = [
+            0x54, 0x61, 0x6C, 0x6F, 0x73, 0x44, 0x69, 0x76, 0x69, 0x64, 0x65, 0x6E, 0x64, 0x73,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(INTERFACE_NAMESPACE, "TalosDividends");
+        assert_eq!(INTERFACE_ID, expected);
+        assert_eq!(client.interface_id().to_array(), expected);
+    }
+
+    #[test]
+    fn supports_version_checks_major_minor_and_patch() {
+        let (_, _, _, _, client) = setup();
+        assert!(client.supports_version(&1, &0, &0));
+        assert!(client.supports_version(&1, &1, &0));
+        assert!(client.supports_version(&1, &2, &0));
+        assert!(!client.supports_version(&1, &1, &1));
+        assert!(!client.supports_version(&1, &3, &0));
+        assert!(!client.supports_version(&2, &0, &0));
+    }
+
+    #[test]
+    fn interface_features_lists_dividends_capabilities() {
+        let (env, _, _, _, client) = setup();
+        let features = client.interface_features();
+        for feature in features_list() {
+            assert!(features.contains(&Symbol::new(&env, feature)));
+        }
+        assert_eq!(features.len(), features_list().len() as u32);
     }
 
     // ── initialize() ─────────────────────────────────────────────────────────
@@ -3615,7 +3821,7 @@ mod tests {
         let (env, contract_id, admin, _registry, client) = setup();
         let talos_id = 1u32;
         env.ledger().with_mut(|li| {
-            li.sequence = 100;
+            li.sequence_number = 100;
         });
 
         let epoch_id = commit_epoch(&env, &contract_id, &client, &admin, talos_id, 10_000, 86_400);
@@ -3627,7 +3833,7 @@ mod tests {
 
         // Advance ledger and claim dividend
         env.ledger().with_mut(|li| {
-            li.sequence = 250;
+            li.sequence_number = 250;
             li.timestamp = 2_000;
         });
 
@@ -3679,21 +3885,21 @@ mod tests {
         let (env, contract_id, admin, _registry, client) = setup();
         let talos_id = 1u32;
         env.ledger().with_mut(|li| {
-            li.sequence = 10;
+            li.sequence_number = 10;
         });
 
         let epoch_id = commit_epoch(&env, &contract_id, &client, &admin, talos_id, 10_000, 86_400);
 
         // Near touch (below threshold) -> skipped
         env.ledger().with_mut(|li| {
-            li.sequence = 10 + ttl_manager::RENEWAL_THRESHOLD - 1;
+            li.sequence_number = 10 + ttl_manager::RENEWAL_THRESHOLD - 1;
         });
         let touched = client.touch_epoch(&talos_id, &epoch_id);
         assert!(!touched);
 
         // At or above threshold -> touched
         env.ledger().with_mut(|li| {
-            li.sequence = 10 + ttl_manager::RENEWAL_THRESHOLD;
+            li.sequence_number = 10 + ttl_manager::RENEWAL_THRESHOLD;
         });
         let touched2 = client.touch_epoch(&talos_id, &epoch_id);
         assert!(touched2);
@@ -3714,7 +3920,7 @@ mod tests {
         let (env, contract_id, admin, _registry, client) = setup();
         let talos_id = 1u32;
         env.ledger().with_mut(|li| {
-            li.sequence = 100;
+            li.sequence_number = 100;
         });
 
         let ep1 = commit_epoch(&env, &contract_id, &client, &admin, talos_id, 1_000, 86_400);
@@ -3723,7 +3929,7 @@ mod tests {
 
         // Set LastTouched for ep1 to age 300, ep2 to age 150, ep3 to age 50
         env.ledger().with_mut(|li| {
-            li.sequence = 1000;
+            li.sequence_number = 1000;
         });
         env.as_contract(&contract_id, || {
             env.storage().persistent().set(&DataKey::LastTouched(talos_id, ep1), &700u32); // age = 300
@@ -3770,7 +3976,7 @@ mod tests {
         let expiry_secs = MAX_EXPIRY_SECS; // 365 days (~6.3 million ledgers at 5s/ledger)
 
         env.ledger().with_mut(|li| {
-            li.sequence = 1_000;
+            li.sequence_number = 1_000;
             li.timestamp = 10_000;
         });
 
@@ -3778,7 +3984,7 @@ mod tests {
 
         // Advance ledger by 2_500_000 ledgers (~145 days, within expiry)
         env.ledger().with_mut(|li| {
-            li.sequence = 1_000 + 2_500_000;
+            li.sequence_number = 1_000 + 2_500_000;
             li.timestamp = 10_000 + (2_500_000 * 5);
         });
 
@@ -3788,7 +3994,7 @@ mod tests {
 
         // Advance ledger another 2_500_000 ledgers (~290 days total, still within MAX_EXPIRY_SECS)
         env.ledger().with_mut(|li| {
-            li.sequence = 1_000 + 5_000_000;
+            li.sequence_number = 1_000 + 5_000_000;
             li.timestamp = 10_000 + (5_000_000 * 5);
         });
 
@@ -3843,14 +4049,14 @@ mod tests {
         let (env, contract_id, admin, _registry, client) = setup();
         let talos_id = 1u32;
         env.ledger().with_mut(|li| {
-            li.sequence = 100;
+            li.sequence_number = 100;
         });
 
         let ep = commit_epoch(&env, &contract_id, &client, &admin, talos_id, 10_000, 86_400);
 
         // Advance sequence near critical threshold
         env.ledger().with_mut(|li| {
-            li.sequence = 100 + ttl_manager::CRITICAL_THRESHOLD + 10;
+            li.sequence_number = 100 + ttl_manager::CRITICAL_THRESHOLD + 10;
         });
 
         let (min_age, max_age, warn, crit, total) = client.get_storage_health(&talos_id);
@@ -3868,6 +4074,129 @@ mod tests {
         assert_eq!(crit2, 0);
         assert_eq!(min_age2, 0);
         assert_eq!(max_age2, 0);
+    }
+
+    // ── set_registry_contract() ───────────────────────────────────────────────
+
+    #[test]
+    fn set_registry_contract_unauthorized_update_fails() {
+        let (env, contract_id, _admin, _, client) = setup();
+        let impostor = Address::generate(&env);
+        let new_registry = Address::generate(&env);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &impostor,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_registry_contract",
+                    args: (impostor.clone(), new_registry.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_registry_contract(&impostor, &new_registry);
+
+        assert_eq!(res, Err(Ok(ContractError::Unauthorized)));
+    }
+
+    /// Mock registry contract that returns compatible interface_id and version
+    #[contract]
+    struct MockCompatibleRegistry;
+
+    #[contractimpl]
+    impl MockCompatibleRegistry {
+        pub fn interface_id(_env: Env) -> BytesN<32> {
+            BytesN::from_array(&_env, &EXPECTED_REGISTRY_INTERFACE_ID)
+        }
+
+        pub fn version(_env: Env) -> (u32, u32, u32) {
+            (1, 4, 0)
+        }
+    }
+
+    #[test]
+    fn set_registry_contract_authorized_update_succeeds() {
+        let env = Env::default();
+        env.ledger().with_mut(|li| {
+            li.timestamp = 1_000;
+        });
+        let contract_id = env.register_contract(None, TalosDividends);
+        let client = TalosDividendsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let registry = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (admin.clone(), registry.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin, &registry);
+
+        // Register a mock compatible registry
+        let new_registry_id = env.register_contract(None, MockCompatibleRegistry);
+        let new_registry = new_registry_id.clone();
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_registry_contract",
+                    args: (admin.clone(), new_registry.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_registry_contract(&admin, &new_registry);
+
+        assert_eq!(client.get_registry(), Some(new_registry.clone()));
+
+        // Verify the event was emitted
+        let events = env.events().all();
+        let reg_upd_events: std::vec::Vec<_> = events
+            .iter()
+            .filter(|(addr, topics, _)| {
+                if *addr != contract_id || topics.len() == 0 {
+                    return false;
+                }
+                let sym: Result<Symbol, _> =
+                    TryFromVal::try_from_val(&env, &topics.get(0).unwrap());
+                sym.map(|s| s == symbol_short!("reg_upd")).unwrap_or(false)
+            })
+            .collect();
+
+        assert_eq!(reg_upd_events.len(), 1);
+        let (_, _, data) = reg_upd_events[0].clone();
+        let (old, new): (Address, Address) = TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(old, registry);
+        assert_eq!(new, new_registry);
+    }
+
+    #[test]
+    fn set_registry_contract_incompatible_registry_fails() {
+        let (env, contract_id, admin, _, client) = setup();
+        // Use an arbitrary address that doesn't implement the interface
+        let incompatible_registry = Address::generate(&env);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_registry_contract",
+                    args: (admin.clone(), incompatible_registry.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_registry_contract(&admin, &incompatible_registry);
+
+        // The contract will fail when trying to invoke the interface_id method
+        // on a non-existent contract, which results in an error
+        assert!(res.is_err());
     }
 }
 
